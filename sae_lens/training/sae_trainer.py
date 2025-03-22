@@ -1,6 +1,6 @@
 import contextlib
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Any, Optional, Protocol, cast
 
 import torch
 import wandb
@@ -48,7 +48,7 @@ class SaveCheckpointFn(Protocol):
         self,
         trainer: "SAETrainer",
         checkpoint_name: str,
-        wandb_aliases: list[str] | None = None,
+        wandb_aliases: Optional[list[str]] = None,
     ) -> None: ...
 
 
@@ -62,12 +62,14 @@ class SAETrainer:
         model: HookedRootModule,
         sae: TrainingSAE,
         activation_store: ActivationsStore,
+        val_activations_store: ActivationsStore,
         save_checkpoint_fn: SaveCheckpointFn,
         cfg: LanguageModelSAERunnerConfig,
     ) -> None:
         self.model = model
         self.sae = sae
         self.activations_store = activation_store
+        self.val_activations_store = val_activations_store
         self.save_checkpoint = save_checkpoint_fn
         self.cfg = cfg
 

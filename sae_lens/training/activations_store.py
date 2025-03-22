@@ -146,6 +146,66 @@ class ActivationsStore:
         )
 
     @classmethod
+    def val_from_config(
+        cls,
+        model: HookedRootModule,
+        cfg: LanguageModelSAERunnerConfig | CacheActivationsRunnerConfig,
+        override_dataset: HfDataset | None = None,
+    ) -> ActivationsStore:
+        if isinstance(cfg, CacheActivationsRunnerConfig):
+            return cls.from_cache_activations(model, cfg)
+
+        cached_activations_path = cfg.cached_activations_path
+        # set cached_activations_path to None if we're not using cached activations
+        if (
+            isinstance(cfg, LanguageModelSAERunnerConfig)
+            and not cfg.use_cached_activations
+        ):
+            cached_activations_path = None
+
+        if override_dataset is None and cfg.dataset_path == "":
+            raise ValueError(
+                "You must either pass in a dataset or specify a dataset_path in your configutation."
+            )
+
+        device = torch.device(cfg.act_store_device)
+        exclude_special_tokens = cfg.exclude_special_tokens
+        if exclude_special_tokens is False:
+            exclude_special_tokens = None
+        if exclude_special_tokens is True:
+            exclude_special_tokens = _get_special_token_ids(model.tokenizer)  # type: ignore
+        if exclude_special_tokens is not None:
+            exclude_special_tokens = torch.tensor(
+                exclude_special_tokens, dtype=torch.long, device=device
+            )
+        return cls(
+            model=model,
+            dataset=override_dataset or cfg.dataset_path,
+            streaming=cfg.streaming,
+            hook_name=cfg.hook_name,
+            hook_layer=cfg.hook_layer,
+            hook_head_index=cfg.hook_head_index,
+            context_size=cfg.context_size,
+            d_in=cfg.d_in,
+            n_batches_in_buffer=cfg.n_batches_in_buffer,
+            total_training_tokens=cfg.training_tokens,
+            store_batch_size_prompts=cfg.store_batch_size_prompts,
+            train_batch_size_tokens=cfg.train_batch_size_tokens,
+            prepend_bos=cfg.prepend_bos,
+            normalize_activations=cfg.normalize_activations,
+            device=device,
+            dtype=cfg.dtype,
+            cached_activations_path=cached_activations_path,
+            model_kwargs=cfg.model_kwargs,
+            autocast_lm=cfg.autocast_lm,
+            dataset_trust_remote_code=cfg.dataset_trust_remote_code,
+            seqpos_slice=cfg.seqpos_slice,
+            exclude_special_tokens=exclude_special_tokens,
+            val_dataset = True,
+        )
+    
+
+    @classmethod
     def from_sae(
         cls,
         model: HookedRootModule,
@@ -204,31 +264,9 @@ class ActivationsStore:
         dataset_trust_remote_code: bool | None = None,
         seqpos_slice: tuple[int | None, ...] = (None,),
         exclude_special_tokens: torch.Tensor | None = None,
+        val_dataset: bool = False,
     ):
-        self.model = model
-        if model_kwargs is None:
-            model_kwargs = {}
-        self.model_kwargs = model_kwargs
-        self.dataset = (
-            load_dataset(
-                dataset,
-                split="train",
-                streaming=streaming,
-                trust_remote_code=dataset_trust_remote_code,  # type: ignore
-            )
-            if isinstance(dataset, str)
-            else dataset
-        )
-
-        if isinstance(dataset, (Dataset, DatasetDict)):
-            self.dataset = cast(Dataset | DatasetDict, self.dataset)
-            n_samples = len(self.dataset)
-
-            if n_samples < total_training_tokens:
-                warnings.warn(
-                    f"The training dataset contains fewer samples ({n_samples}) than the number of samples required by your training configuration ({total_training_tokens}). This will result in multiple training epochs and some samples being used more than once."
-                )
-
+        
         self.hook_name = hook_name
         self.hook_layer = hook_layer
         self.hook_head_index = hook_head_index
@@ -251,6 +289,41 @@ class ActivationsStore:
         self.n_dataset_processed = 0
 
         self.estimated_norm_scaling_factor = None
+        self.model = model
+        if model_kwargs is None:
+            model_kwargs = {}
+        self.model_kwargs = model_kwargs
+        if val_dataset == False:
+            self.dataset = (
+                load_dataset(
+                    dataset,
+                    split="train",
+                    streaming=streaming,
+                    trust_remote_code=dataset_trust_remote_code,  # type: ignore
+                )
+                if isinstance(dataset, str)
+                else dataset
+            )
+        elif val_dataset == True:
+            self.dataset = (
+                load_dataset(
+                    dataset,
+                    split="validation",
+                    streaming=streaming,
+                    trust_remote_code=dataset_trust_remote_code,  # type: ignore
+                )
+                if isinstance(dataset, str)
+                else dataset
+            )
+
+        if isinstance(dataset, (Dataset, DatasetDict)):
+            self.dataset = cast(Dataset | DatasetDict, self.dataset)
+            n_samples = len(self.dataset)
+
+            if n_samples < total_training_tokens:
+                warnings.warn(
+                    f"The training dataset contains fewer samples ({n_samples}) than the number of samples required by your training configuration ({total_training_tokens}). This will result in multiple training epochs and some samples being used more than once."
+                )
 
         # Check if dataset is tokenized
         dataset_sample = next(iter(self.dataset))

@@ -71,6 +71,12 @@ class SAETrainingRunner:
             override_dataset=override_dataset,
         )
 
+        self.val_activations_store = ActivationsStore.val_from_config(
+            self.model,
+            self.cfg,
+            override_dataset=override_dataset,
+        )
+
         if override_sae is None:
             if self.cfg.from_pretrained_path is not None:
                 self.sae = TrainingSAE.load_from_pretrained(
@@ -104,6 +110,7 @@ class SAETrainingRunner:
             model=self.model,
             sae=self.sae,
             activation_store=self.activations_store,
+            val_activations_store=self.val_activations_store,
             save_checkpoint_fn=self.save_checkpoint,
             cfg=self.cfg,
         )
