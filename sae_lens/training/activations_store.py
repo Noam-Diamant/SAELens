@@ -305,7 +305,10 @@ class ActivationsStore:
                 else dataset
             )
         elif val_dataset == True:
-            self.dataset = (
+            self.batch_rows = self.train_batch_size_tokens // self.context_size
+            self.val_batches_count = 512
+            self.num_rows_val_dataset = self.val_batches_count * self.batch_rows
+            self.val_entire_dataset = (
                 load_dataset(
                     dataset,
                     split="validation",
@@ -315,6 +318,7 @@ class ActivationsStore:
                 if isinstance(dataset, str)
                 else dataset
             )
+            self.dataset = self.val_entire_dataset.take(self.num_rows_val_dataset)
 
         if isinstance(dataset, (Dataset, DatasetDict)):
             self.dataset = cast(Dataset | DatasetDict, self.dataset)
@@ -489,12 +493,12 @@ class ActivationsStore:
 
         return activations_dataset
 
-    def set_norm_scaling_factor_if_needed(self):
+    def set_norm_scaling_factor_if_needed(self, n_batches_for_norm_estimate: int = int(1e3)):
         if (
             self.normalize_activations == "expected_average_only_in"
             and self.estimated_norm_scaling_factor is None
         ):
-            self.estimated_norm_scaling_factor = self.estimate_norm_scaling_factor()
+            self.estimated_norm_scaling_factor = self.estimate_norm_scaling_factor(n_batches_for_norm_estimate=n_batches_for_norm_estimate)
 
     def apply_norm_scaling_factor(self, activations: torch.Tensor) -> torch.Tensor:
         if self.estimated_norm_scaling_factor is None:

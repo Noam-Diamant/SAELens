@@ -177,6 +177,9 @@ class SAETrainer:
         pbar = tqdm(total=self.cfg.total_training_tokens, desc="Training SAE")
 
         self.activations_store.set_norm_scaling_factor_if_needed()
+        self.val_activations_store.set_norm_scaling_factor_if_needed(n_batches_for_norm_estimate=100)
+        # reset iterator
+        self.val_activations_store.iterable_sequences = self.val_activations_store._iterate_tokenized_sequences()
 
         # Train loop
         while self.n_training_tokens < self.cfg.total_training_tokens:
@@ -184,13 +187,44 @@ class SAETrainer:
             layer_acts = self.activations_store.next_batch()[:, 0, :].to(
                 self.sae.device
             )
-            self.n_training_tokens += self.cfg.train_batch_size_tokens
-
             step_output = self._train_step(sae=self.sae, sae_in=layer_acts)
+            sum_metrics = {}
+            if (self.n_training_steps % 5000) == 0 or self.n_training_tokens == (self.cfg.total_training_tokens - self.cfg.train_batch_size_tokens):
+                # reset iterator
+                self.val_activations_store.iterable_sequences = self.val_activations_store._iterate_tokenized_sequences()
+                for i in range(self.val_activations_store.val_batches_count):
+                    val_layer_acts = self.val_activations_store.next_batch()[:, 0, :].to(
+                        self.sae.device
+                    )
+                    #calc batch output
+                    val_batch_output = self._eval_step(self.sae, sae_in=val_layer_acts)
+                    #save to dict
+                    val_batch_dict = self._build_val_step_log_dict(val_output=val_batch_output, n_training_tokens=self.n_training_tokens)
+                        # Accumulate metrics
+                    for key, value in val_batch_dict.items():
+                        if key not in sum_metrics:
+                            if isinstance(value, torch.Tensor):
+                                sum_metrics[key] = value.clone().detach().float()  # Clone and convert tensor to float
+                            else:
+                                sum_metrics[key] = float(value)  # Convert int/float to float
+                        else:
+                            if isinstance(value, torch.Tensor):
+                                sum_metrics[key] += value.detach().float()
+                            else:
+                                sum_metrics[key] += float(value)
+
+                # Compute averages
+                val_output = {key: sum_metrics[key] / self.val_activations_store.val_batches_count for key in sum_metrics}
+                self.val_activations_store.iterable_sequences = self.val_activations_store._iterate_tokenized_sequences()
+
+            self.n_training_tokens += self.cfg.train_batch_size_tokens
 
             if self.cfg.log_to_wandb:
                 self._log_train_step(step_output)
                 self._run_and_log_evals()
+                if (self.n_training_steps % 5000) == 0 or self.n_training_tokens == (self.cfg.total_training_tokens - self.cfg.train_batch_size_tokens):
+                    self._log_val_step(val_dict=val_output)
+                    self._run_and_log_evals(val_set=True)
 
             self._checkpoint_if_needed()
             self.n_training_steps += 1
@@ -215,6 +249,23 @@ class SAETrainer:
 
         pbar.close()
         return self.sae
+
+    ########################################################################
+    # ADDED FUNCTION
+    def _eval_step(
+    self,
+    sae: TrainingSAE,
+    sae_in: torch.Tensor,
+    ) -> TrainStepOutput:
+        sae.eval()  # Set model to evaluation mode
+        with torch.no_grad():  # Disable gradient computation
+            eval_output = self.sae.training_forward_pass(
+                sae_in=sae_in,
+                dead_neuron_mask=self.dead_neurons,
+                current_l1_coefficient=self.current_l1_coefficient,  # Keep same L1 coefficient
+            )
+        return eval_output  # Return test set output
+    ########################################################################
 
     def _train_step(
         self,
@@ -280,6 +331,13 @@ class SAETrainer:
                 ),
                 step=self.n_training_steps,
             )
+    @torch.no_grad()
+    def _log_val_step(self, val_dict: dict[str, Any]):
+        wandb.log(
+            val_dict,
+            step=self.n_training_steps,
+        )
+    
 
     @torch.no_grad()
     def _build_train_step_log_dict(
@@ -294,6 +352,10 @@ class SAETrainer:
 
         # metrics for currents acts
         l0 = (feature_acts > 0).float().sum(-1).mean()
+        ########################################################################
+        # ADDED
+        l0_precentage = (l0 / (self.cfg.d_in * self.cfg.expansion_factor)) * 100
+        ########################################################################
         current_learning_rate = self.optimizer.param_groups[0]["lr"]
 
         per_token_l2_loss = (sae_out - sae_in).pow(2).sum(dim=-1).squeeze()
@@ -307,6 +369,7 @@ class SAETrainer:
             "metrics/explained_variance": explained_variance.mean().item(),
             "metrics/explained_variance_std": explained_variance.std().item(),
             "metrics/l0": l0.item(),
+            "metrics/l0_precentage": l0_precentage.item(),
             # sparsity
             "sparsity/mean_passes_since_fired": self.n_forward_passes_since_fired.mean().item(),
             "sparsity/dead_features": self.dead_neurons.sum().item(),
@@ -328,25 +391,42 @@ class SAETrainer:
         return log_dict
 
     @torch.no_grad()
-    def _run_and_log_evals(self):
+    def _run_and_log_evals(self, val_set: bool = False):
         # record loss frequently, but not all the time.
         if (self.n_training_steps + 1) % (
             self.cfg.wandb_log_frequency * self.cfg.eval_every_n_wandb_logs
-        ) == 0:
+        ) == 0 or val_set == True:
             self.sae.eval()
-            ignore_tokens = set()
-            if self.activations_store.exclude_special_tokens is not None:
-                ignore_tokens = set(
-                    self.activations_store.exclude_special_tokens.tolist()
-                )
-            eval_metrics, _ = run_evals(
-                sae=self.sae,
-                activation_store=self.activations_store,
-                model=self.model,
-                eval_config=self.trainer_eval_config,
-                ignore_tokens=ignore_tokens,
-                model_kwargs=self.cfg.model_kwargs,
-            )  # not calculating featurwise metrics here.
+            if val_set==False:
+                ignore_tokens = set()
+                if self.activations_store.exclude_special_tokens is not None:
+                    ignore_tokens = set(
+                        self.activations_store.exclude_special_tokens.tolist()
+                    )
+                eval_metrics, _ = run_evals(
+                    sae=self.sae,
+                    activation_store=self.activations_store,
+                    model=self.model,
+                    eval_config=self.trainer_eval_config,
+                    ignore_tokens=ignore_tokens,
+                    model_kwargs=self.cfg.model_kwargs,
+                )  # not calculating featurwise metrics here.
+            else:
+                ignore_tokens = set()
+                if self.val_activations_store.exclude_special_tokens is not None:
+                    ignore_tokens = set(
+                        self.val_activations_store.exclude_special_tokens.tolist()
+                    )
+                eval_metrics, _ = run_evals(
+                    sae=self.sae,
+                    activation_store=self.val_activations_store,
+                    model=self.model,
+                    eval_config=self.trainer_eval_config,
+                    ignore_tokens=ignore_tokens,
+                    model_kwargs=self.cfg.model_kwargs,
+                )  # not calculating featurwise metrics here.
+                
+
 
             # Remove eval metrics that are already logged during training
             eval_metrics.pop("metrics/explained_variance", None)
@@ -369,6 +449,10 @@ class SAETrainer:
                 eval_metrics["weights/b_gate"] = wandb.Histogram(b_gate_dist)  # type: ignore
                 b_mag_dist = self.sae.b_mag.detach().float().cpu().numpy()
                 eval_metrics["weights/b_mag"] = wandb.Histogram(b_mag_dist)  # type: ignore
+
+            if val_set==True:
+                val_eval_metrics = {f"val/{k}": v for k, v in eval_metrics.items()}
+                eval_metrics = val_eval_metrics
 
             wandb.log(
                 eval_metrics,
@@ -440,7 +524,67 @@ class SAETrainer:
                     param.requires_grad = False
 
             self.finetuning = True
+    
+    @torch.no_grad()
+    def _build_val_step_log_dict(
+        self,
+        val_output: TrainStepOutput,
+        n_training_tokens: int,
+    ) -> dict[str, Any]:
+        ########################################################################
+        ########################################################################
+        ########################################################################
+        ########################################################################
+        ########################################################################
+        ########################################################################
+        # ADDED
+
+        val_sae_in = val_output.sae_in
+        val_sae_out = val_output.sae_out
+        val_feature_acts = val_output.feature_acts
+        val_loss = val_output.loss.item()
+
+        # metrics for currents acts
+        val_l0 = (val_feature_acts > 0).float().sum(-1).mean()
+        ########################################################################
+        # ADDED
+        val_l0_precentage = (val_l0 / (self.cfg.d_in *self.cfg.expansion_factor)) * 100
+        ########################################################################
+        val_current_learning_rate = self.optimizer.param_groups[0]["lr"]
+
+        val_per_token_l2_loss = (val_sae_out - val_sae_in).pow(2).sum(dim=-1).squeeze()
+        val_total_variance = (val_sae_in - val_sae_in.mean(0)).pow(2).sum(-1)
+        val_explained_variance = 1 - val_per_token_l2_loss / val_total_variance
+
+        val_log_dict = {
+            # losses
+            "val/losses/overall_loss": val_loss,
+            # variance explained
+            "val/metrics/explained_variance": val_explained_variance.mean().item(),
+            "val/metrics/explained_variance_std": val_explained_variance.std().item(),
+            "val/metrics/l0": val_l0.item(),
+            "val/metrics/l0_precentage": val_l0_precentage.item(),
+            # sparsity
+            "val/sparsity/mean_passes_since_fired": self.n_forward_passes_since_fired.mean().item(),
+            "val/sparsity/dead_features": self.dead_neurons.sum().item(),
+            "val/details/current_learning_rate": val_current_learning_rate,
+            "val/details/current_l1_coefficient": self.current_l1_coefficient,
+            "val/details/n_training_tokens": n_training_tokens,
+        }
+        for val_loss_name, val_loss_value in val_output.losses.items():
+            val_loss_item = _unwrap_item(val_loss_value)
+            # special case for l1 loss, which we normalize by the l1 coefficient
+            if val_loss_name == "l1_loss":
+                val_log_dict[f"val/losses/{val_loss_name}"] = (
+                    val_loss_item / self.current_l1_coefficient
+                )
+                val_log_dict[f"val/losses/raw_{val_loss_name}"] = val_loss_item
+            else:
+                val_log_dict[f"val/losses/{val_loss_name}"] = val_loss_item
+        return val_log_dict
 
 
 def _unwrap_item(item: float | torch.Tensor) -> float:
     return item.item() if isinstance(item, torch.Tensor) else item
+
+
