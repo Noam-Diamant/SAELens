@@ -306,7 +306,7 @@ class LanguageModelSAERunnerConfig:
         )
 
         if self.run_name is None:
-            self.run_name = f"{self.d_sae}-L1-{self.l1_coefficient}-LR-{self.lr}-Tokens-{self.training_tokens:3.3e}"
+            self.run_name = f"layer_{self.hook_layer}_model_{self.model_name}_hook_name_{self.hook_name}_lr{int(self.lr * (10**5))}e5_steps{self.total_training_steps // 1000}k_alpha{self.l1_coefficient}"
 
         if self.model_from_pretrained_kwargs is None:
             if self.model_class_name == "HookedTransformer":
